@@ -1,0 +1,5 @@
+dnd_env/
+data/
+__pycache__/
+*.pyc
+.env
