@@ -1,5 +1,6 @@
 import io
 import os
+import uuid
 import struct
 import select
 import asyncio
@@ -85,6 +86,7 @@ class VoiceManager:
 
         self.user_buffers = defaultdict(bytearray)
         self.user_last_active = {}
+        self._decoders = {}
         self._lock = threading.Lock()
 
         self.silence_threshold = 0.02
@@ -120,106 +122,108 @@ class VoiceManager:
         rms = (sum(s ** 2 for s in samples) / len(samples)) ** 0.5
         return rms / 32768.0
 
-    def _parse_rtp_header(self, data):
-        if len(data) < 12:
-            return None
-
-        version = (data[0] >> 6) & 0x03
-        padding = (data[0] >> 5) & 0x01
-        extension = (data[0] >> 4) & 0x01
-        csrc_count = data[0] & 0x0F
-
-        sequence = struct.unpack('>H', data[2:4])[0]
-        timestamp = struct.unpack('>I', data[4:8])[0]
-        ssrc = struct.unpack('>I', data[8:12])[0]
-
-        header_size = 12 + (csrc_count * 4)
-        if extension and len(data) > header_size + 4:
-            ext_length = struct.unpack('>H', data[header_size + 2:header_size + 4])[0]
-            header_size += 4 + (ext_length * 4)
-
-        return {
-            'ssrc': ssrc,
-            'sequence': sequence,
-            'timestamp': timestamp,
-            'header': data[:header_size],
-            'payload': data[header_size:],
-        }
+    @staticmethod
+    def _strip_header_ext(data):
+        # RTP one-byte extension header (profile 0xBEDE). In the _rtpsize AEAD
+        # modes the extension lives inside the *encrypted* payload, so it must
+        # be stripped only after decryption.
+        if len(data) >= 4 and data[0] == 0xBE and data[1] == 0xDE:
+            length = struct.unpack_from('>H', data, 2)[0]
+            offset = 4 + length * 4
+            data = data[offset:]
+        return data
 
     def _decrypt_packet(self, data, voice_client):
-        rtp = self._parse_rtp_header(data)
-        if rtp is None:
+        # Need at least a 12-byte RTP header + 4-byte trailing nonce.
+        if len(data) < 16:
             return None, None
 
-        payload = rtp['payload']
-        header = rtp['header']
-        ssrc = rtp['ssrc']
+        # Skip RTCP control packets (payload types 200-204); they aren't audio.
+        if 200 <= data[1] <= 204:
+            return None, None
+
+        ssrc = struct.unpack_from('>I', data, 8)[0]
 
         key = voice_client.secret_key
         mode = voice_client.mode
-
         if not key or not mode:
             return ssrc, None
+
+        # For every supported mode the authenticated header is exactly the
+        # 12-byte base RTP header. CSRC/extension bytes are part of the
+        # ciphertext and are stripped after decryption.
+        header = bytes(data[:12])
 
         try:
             key_bytes = bytes(key)
 
-            if mode == 'xsalsa20_poly1305':
+            if mode == 'aead_xchacha20_poly1305_rtpsize':
                 import nacl.secret
                 nonce = bytearray(24)
-                nonce[:12] = data[:12]
-                box = nacl.secret.SecretBox(key_bytes)
-                decrypted = box.decrypt(bytes(payload), bytes(nonce))
-                return ssrc, decrypted
+                nonce[:4] = data[-4:]
+                ciphertext = bytes(data[12:-4])
+                decrypted = nacl.secret.Aead(key_bytes).decrypt(
+                    ciphertext, header, bytes(nonce)
+                )
+
+            elif mode == 'aead_aes256_gcm_rtpsize':
+                from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+                nonce = bytearray(12)
+                nonce[:4] = data[-4:]
+                ciphertext = bytes(data[12:-4])
+                decrypted = AESGCM(key_bytes).decrypt(
+                    bytes(nonce), ciphertext, header
+                )
+
+            elif mode == 'xsalsa20_poly1305':
+                import nacl.secret
+                nonce = bytearray(24)
+                nonce[:12] = header
+                decrypted = nacl.secret.SecretBox(key_bytes).decrypt(
+                    bytes(data[12:]), bytes(nonce)
+                )
 
             elif mode == 'xsalsa20_poly1305_suffix':
                 import nacl.secret
-                if len(payload) < 24:
-                    return ssrc, None
-                nonce = payload[-24:]
-                encrypted = payload[:-24]
-                box = nacl.secret.SecretBox(key_bytes)
-                decrypted = box.decrypt(encrypted, nonce)
-                return ssrc, decrypted
+                nonce = bytes(data[-24:])
+                decrypted = nacl.secret.SecretBox(key_bytes).decrypt(
+                    bytes(data[12:-24]), nonce
+                )
 
             elif mode == 'xsalsa20_poly1305_lite':
                 import nacl.secret
-                if len(payload) < 4:
-                    return ssrc, None
                 nonce = bytearray(24)
-                nonce[:4] = payload[-4:]
-                encrypted = payload[:-4]
-                box = nacl.secret.SecretBox(key_bytes)
-                decrypted = box.decrypt(bytes(encrypted), bytes(nonce))
-                return ssrc, decrypted
-
-            elif mode == 'aead_xchacha20_poly1305_rtpsize':
-                import nacl.secret
-                if len(payload) < 4:
-                    return ssrc, None
-                nonce = bytearray(24)
-                nonce[:4] = payload[-4:]
-                encrypted = payload[:-4]
-                box = nacl.secret.Aead(key_bytes)
-                decrypted = box.decrypt(bytes(encrypted), bytes(header), bytes(nonce))
-                return ssrc, decrypted
+                nonce[:4] = data[-4:]
+                decrypted = nacl.secret.SecretBox(key_bytes).decrypt(
+                    bytes(data[12:-4]), bytes(nonce)
+                )
 
             else:
-                if self._decrypt_fail_count <= 3:
-                    print(f"[VOICE] Unknown encryption mode: {mode}")
+                if self._decrypt_fail_count < 1:
+                    print(f"[VOICE] Unsupported encryption mode: {mode}")
+                self._decrypt_fail_count += 1
                 return ssrc, None
+
+            return ssrc, self._strip_header_ext(decrypted)
 
         except Exception as e:
             self._decrypt_fail_count += 1
             if self._decrypt_fail_count <= 5:
-                print(f"[VOICE] Decrypt failed (ssrc={ssrc}, mode={mode}, payload_len={len(payload)}): {e}")
+                print(f"[VOICE] Decrypt failed (ssrc={ssrc}, mode={mode}, len={len(data)}): {e}")
             return ssrc, None
 
-    def _decode_opus_to_pcm(self, opus_data):
+    def _decode_opus_to_pcm(self, ssrc, opus_data):
+        # Opus decoders are stateful per stream, so keep one decoder per SSRC.
         try:
-            decoder = discord.opus.Decoder()
-            pcm = decoder.decode(opus_data, frame_size=self.frame_size)
-            return pcm
+            decoder = self._decoders.get(ssrc)
+            if decoder is None:
+                decoder = discord.opus.Decoder()
+                self._decoders[ssrc] = decoder
+            try:
+                return decoder.decode(opus_data)
+            except TypeError:
+                # Older discord.py opus Decoder.decode requires frame_size.
+                return decoder.decode(opus_data, self.frame_size)
         except Exception as e:
             self._opus_fail_count += 1
             if self._opus_fail_count <= 3:
@@ -264,7 +268,7 @@ class VoiceManager:
             if ssrc is None or opus_data is None:
                 continue
 
-            pcm = self._decode_opus_to_pcm(opus_data)
+            pcm = self._decode_opus_to_pcm(ssrc, opus_data)
             if pcm is None:
                 continue
 
@@ -293,6 +297,7 @@ class VoiceManager:
         self._opus_fail_count = 0
         self._audio_count = 0
         self._last_log_time = 0
+        self._decoders.clear()
 
         print(f"[VOICE] mode={voice_client.mode}, secret_key={'set' if voice_client.secret_key else 'NONE'}")
 
@@ -362,43 +367,40 @@ class VoiceManager:
         if not voice_client.is_connected():
             return
 
+        mp3_path = os.path.join(
+            tempfile.gettempdir(), f"dm_response_{uuid.uuid4().hex}.mp3"
+        )
+
         try:
-            mp3_path = os.path.join(tempfile.gettempdir(), f"dm_response_{id(text)}.mp3")
             await self.tts.synthesize_to_file(text, mp3_path)
 
             if not voice_client.is_connected():
-                try:
-                    os.unlink(mp3_path)
-                except OSError:
-                    pass
                 return
-
-            source = discord.FFmpegPCMAudio(
-                mp3_path,
-                before_options="-i - -f s16le -ar 48000 -ac 2",
-                options="-loglevel quiet"
-            )
-
-            def cleanup():
-                try:
-                    os.unlink(mp3_path)
-                except OSError:
-                    pass
-
-            player = discord.AudioPlayer(source)
-            player.after = cleanup
 
             if voice_client.is_playing():
                 voice_client.stop()
 
-            player.start()
+            source = discord.FFmpegPCMAudio(mp3_path, options="-loglevel quiet")
 
-            while player.is_playing():
-                await asyncio.sleep(0.1)
+            loop = asyncio.get_running_loop()
+            done = asyncio.Event()
+
+            def after_play(error):
+                if error:
+                    print(f"[TTS] Playback finished with error: {error}")
+                loop.call_soon_threadsafe(done.set)
+
+            voice_client.play(source, after=after_play)
+            await done.wait()
 
         except Exception as e:
             print(f"[TTS] Playback error: {e}")
             traceback.print_exc()
+        finally:
+            try:
+                os.unlink(mp3_path)
+            except OSError:
+                pass
 
     def stop_listening(self, guild_id):
         self.active_channels[guild_id] = False
@@ -411,5 +413,6 @@ class VoiceManager:
         with self._lock:
             self.user_buffers.clear()
             self.user_last_active.clear()
+            self._decoders.clear()
 
         self._current_voice_client = None
